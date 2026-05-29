@@ -15,8 +15,8 @@ android {
         applicationId = "com.barsam.WireGuardVPN"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.2.0"
 
         // VPN credentials from local.properties — never commit these
         val props = Properties()
