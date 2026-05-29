@@ -1,7 +1,7 @@
 {
   "versionCode": 2,
   "versionName": "1.1.0",
-  "downloadUrl": "",
-  "sha256": "",
-  "changelog": "Security audit complete, auto-update system added"
+  "downloadUrl": "https://github.com/RobotpowerRahh/WireGuardVPN-Android/releases/download/v1.1.0/app-debug.apk",
+  "sha256": "b7f5595c99efb068008a36f0448a7ec2347baab1eaa818c60a025ea21f9db80e",
+  "changelog": "Security audit complete, auto-update system, encrypted storage"
 }
