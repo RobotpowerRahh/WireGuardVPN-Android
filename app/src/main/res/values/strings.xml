@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">WireGuardVPN</string>
+    <string name="vpn_notification_channel">VPN Connection</string>
+    <string name="vpn_notification_title">WireGuardVPN</string>
+    <string name="vpn_notification_text">VPN is active</string>
+</resources>

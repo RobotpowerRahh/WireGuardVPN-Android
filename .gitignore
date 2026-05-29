@@ -1,0 +1,27 @@
+# Built files
+/build/
+/app/build/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Gradle
+.gradle/
+local.properties
+*.iml
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Sensitive — DO NOT commit
+local.properties
+*.keystore
+*.jks
+.env
+credentials.json
+
+# Kotlin
+*.class
