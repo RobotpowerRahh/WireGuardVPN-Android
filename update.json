@@ -1,7 +1,7 @@
 {
-  "versionCode": 4,
-  "versionName": "1.3.0",
-  "downloadUrl": "https://github.com/RobotpowerRahh/WireGuardVPN-Android/releases/download/v1.3.0/app-debug.apk",
-  "sha256": "3cd020d03111e82e2435680bac88e9101c1b0d34197716da34222eaeec43611d",
-  "changelog": "New server migration — connect in Stealth mode after updating. Exits a clean Rogers (Toronto) residential IP."
+  "versionCode": 5,
+  "versionName": "1.3.1",
+  "downloadUrl": "https://github.com/RobotpowerRahh/WireGuardVPN-Android/releases/download/v1.3.1/app-debug.apk",
+  "sha256": "169780b8fab95536950b018777fc016885f579ed058168362b43aed923e6f642",
+  "changelog": "Stealth mode now connects automatically — no server setup needed. Just update and tap Connect."
 }
