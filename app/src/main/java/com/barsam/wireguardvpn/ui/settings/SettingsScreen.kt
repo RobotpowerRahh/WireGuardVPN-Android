@@ -1,5 +1,6 @@
 package com.barsam.wireguardvpn.ui.settings
 
+import com.barsam.wireguardvpn.BuildConfig
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -11,10 +12,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.barsam.wireguardvpn.models.ConnectionMode
+import com.barsam.wireguardvpn.models.ExitMode
 import com.barsam.wireguardvpn.services.UpdateState
 import com.barsam.wireguardvpn.ui.MainViewModel
 import com.barsam.wireguardvpn.ui.VpnUiState
@@ -23,7 +26,6 @@ import com.barsam.wireguardvpn.ui.theme.WireGuardTheme
 @Composable
 fun SettingsScreen(vm: MainViewModel, state: VpnUiState) {
     val context = LocalContext.current
-    var connectionMode by remember { mutableStateOf(ConnectionMode.DIRECT) }
     var autoConnect by remember { mutableStateOf(false) }
     var killSwitch by remember { mutableStateOf(true) }
     var dns by remember { mutableStateOf("1.1.1.1") }
@@ -46,8 +48,17 @@ fun SettingsScreen(vm: MainViewModel, state: VpnUiState) {
 
         SettingsSection("Connection Mode") {
             ConnectionModeSelector(
-                selected = connectionMode,
-                onSelect = { connectionMode = it }
+                selected = state.connectionMode,
+                onSelect = { vm.setConnectionMode(context, it) }
+            )
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        SettingsSection("Exit Network") {
+            ExitModeSelector(
+                selected = state.exitMode,
+                onSelect = { vm.setExitMode(context, it) }
             )
         }
 
@@ -75,7 +86,7 @@ fun SettingsScreen(vm: MainViewModel, state: VpnUiState) {
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("v1.0.0", color = WireGuardTheme.text2, fontSize = 13.sp)
+                        Text("v${BuildConfig.VERSION_NAME}", color = WireGuardTheme.text2, fontSize = 13.sp)
                         TextButton(onClick = { vm.checkForUpdate(context) }) {
                             Text("Check for Updates", color = WireGuardTheme.accent, fontSize = 13.sp)
                         }
@@ -168,10 +179,48 @@ fun SettingsScreen(vm: MainViewModel, state: VpnUiState) {
             }
         }
 
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Remote Debugging
+        SettingsSection("Remote Debugging") {
+            ToggleRow("Send logs to computer", state.telemetryEnabled) { enabled ->
+                vm.setTelemetryEnabled(context, enabled)
+            }
+            if (state.telemetryEnabled) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("Endpoint", color = WireGuardTheme.text3, fontSize = 11.sp)
+                Spacer(modifier = Modifier.height(4.dp))
+                var endpoint by remember { mutableStateOf(state.telemetryEndpoint) }
+                OutlinedTextField(
+                    value = endpoint,
+                    onValueChange = {
+                        endpoint = it
+                        vm.setTelemetryEndpoint(context, it)
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    placeholder = { Text("http://localhost:8420", color = WireGuardTheme.text3, fontSize = 12.sp) },
+                    textStyle = androidx.compose.ui.text.TextStyle(
+                        color = WireGuardTheme.text1,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    ),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = WireGuardTheme.accentBorder,
+                        unfocusedBorderColor = WireGuardTheme.border,
+                        cursorColor = WireGuardTheme.accent
+                    ),
+                    singleLine = true,
+                    shape = RoundedCornerShape(WireGuardTheme.radiusSmall.dp)
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text("Run telemetry_server.py on Mac, then: adb reverse tcp:8420 tcp:8420", color = WireGuardTheme.text3, fontSize = 10.sp)
+            }
+        }
+
         Spacer(modifier = Modifier.height(24.dp))
 
         Text(
-            "WireGuardVPN v1.0.0",
+            "WireGuardVPN v${BuildConfig.VERSION_NAME}",
             color = WireGuardTheme.text3,
             fontSize = 12.sp
         )
@@ -243,6 +292,50 @@ fun ConnectionModeSelector(selected: ConnectionMode, onSelect: (ConnectionMode) 
                         ConnectionMode.DIRECT -> "WireGuard UDP"
                         ConnectionMode.STEALTH -> "VLESS+Reality"
                         ConnectionMode.WARP_STEALTH -> "Via Cloudflare"
+                    },
+                    color = WireGuardTheme.text3,
+                    fontSize = 10.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ExitModeSelector(selected: ExitMode, onSelect: (ExitMode) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        ExitMode.entries.forEach { exit ->
+            val isSelected = exit == selected
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(WireGuardTheme.radiusSmall.dp))
+                    .background(if (isSelected) WireGuardTheme.accentDim else WireGuardTheme.bg)
+                    .border(
+                        1.dp,
+                        if (isSelected) WireGuardTheme.accentBorder else WireGuardTheme.border,
+                        RoundedCornerShape(WireGuardTheme.radiusSmall.dp)
+                    )
+                    .clickable { onSelect(exit) }
+                    .padding(12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    when (exit) {
+                        ExitMode.RESIDENTIAL -> "Residential"
+                        ExitMode.DIRECT -> "Direct"
+                    },
+                    color = if (isSelected) WireGuardTheme.accent else WireGuardTheme.text2,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    when (exit) {
+                        ExitMode.RESIDENTIAL -> "Rogers ISP · best for games"
+                        ExitMode.DIRECT -> "Vultr · faster, full speed"
                     },
                     color = WireGuardTheme.text3,
                     fontSize = 10.sp

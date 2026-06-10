@@ -1,7 +1,7 @@
 {
-  "versionCode": 6,
-  "versionName": "1.3.2",
-  "downloadUrl": "https://github.com/RobotpowerRahh/WireGuardVPN-Android/releases/download/v1.3.2/app-debug.apk",
-  "sha256": "22aab8c0520a1cbd4890f7626476a753edca7fa87031092ac37ce5903afbb1b4",
-  "changelog": "Fixes Stealth mode connectivity — traffic now routes through the tunnel. Update and reconnect in Stealth."
+  "versionCode": 7,
+  "versionName": "1.4.0",
+  "downloadUrl": "https://github.com/RobotpowerRahh/WireGuardVPN-Android/releases/download/v1.4.0/app-debug.apk",
+  "sha256": "e3cbeca28aa228e51aa0d3af511135a07f6e27fb121577d28c9d298287f4f0df",
+  "changelog": "Choose your exit in Settings → Exit Network: Residential (Rogers ISP) or Direct (Vultr, faster). Then connect in Stealth."
 }

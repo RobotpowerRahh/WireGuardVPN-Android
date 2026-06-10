@@ -128,6 +128,20 @@ enum class ConnectionMode(val value: Int) {
     }
 }
 
+/**
+ * Which exit the Stealth tunnel leaves through (same VLESS+Reality server, different port).
+ * - RESIDENTIAL (:443): clean Rogers home-ISP IP — beats datacenter blocks (games/Reddit). The value prop.
+ * - DIRECT (:8444): straight out the Vultr node — faster, full UDP, but a datacenter IP.
+ */
+enum class ExitMode(val value: Int) {
+    RESIDENTIAL(0),
+    DIRECT(1);
+
+    companion object {
+        fun fromValue(value: Int) = entries.find { it.value == value } ?: RESIDENTIAL
+    }
+}
+
 enum class ConnectionState {
     DISCONNECTED,
     CONNECTING,

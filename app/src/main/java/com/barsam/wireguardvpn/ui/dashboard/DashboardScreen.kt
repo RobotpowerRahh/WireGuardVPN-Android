@@ -23,6 +23,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.barsam.wireguardvpn.models.ConnectionState
 import com.barsam.wireguardvpn.models.ConnectionMode
+import com.barsam.wireguardvpn.models.ExitMode
 import com.barsam.wireguardvpn.ui.MainViewModel
 import com.barsam.wireguardvpn.ui.VpnUiState
 import com.barsam.wireguardvpn.ui.theme.WireGuardTheme
@@ -102,7 +103,7 @@ fun DashboardScreen(vm: MainViewModel, state: VpnUiState) {
                                 vm.requestConnect(
                                     context as android.app.Activity,
                                     profile,
-                                    state.activeMode
+                                    state.connectionMode
                                 )
                             }
                         }
@@ -136,9 +137,12 @@ fun DashboardScreen(vm: MainViewModel, state: VpnUiState) {
             fontWeight = FontWeight.Medium
         )
 
-        if (!connected && state.profiles.isNotEmpty()) {
+        if (!connected) {
+            val exitLabel = if (state.exitMode == ExitMode.RESIDENTIAL) "Residential (Rogers)" else "Direct (Vultr)"
             Text(
-                text = "Server: ${state.profiles.first().name}",
+                text = if (state.connectionMode == ConnectionMode.DIRECT)
+                    "Server: ${state.profiles.firstOrNull()?.name ?: "None"}"
+                else "Exit: $exitLabel",
                 color = WireGuardTheme.text3,
                 fontSize = 11.sp
             )
@@ -169,12 +173,14 @@ fun DashboardScreen(vm: MainViewModel, state: VpnUiState) {
                 horizontalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 InfoChip("Uptime", formatDuration(state.connectedDuration))
-                InfoChip("Server", state.activeProfile?.name ?: "Unknown")
                 if (state.activeMode != ConnectionMode.DIRECT) {
+                    InfoChip("Exit", if (state.exitMode == ExitMode.RESIDENTIAL) "Residential" else "Direct")
                     InfoChip(
                         "Mode",
                         if (state.activeMode == ConnectionMode.STEALTH) "VLESS+Reality" else "WARP+Reality"
                     )
+                } else {
+                    InfoChip("Server", state.activeProfile?.name ?: "Unknown")
                 }
             }
         }

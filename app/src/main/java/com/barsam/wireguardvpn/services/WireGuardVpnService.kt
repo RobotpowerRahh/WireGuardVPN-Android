@@ -8,13 +8,20 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import com.barsam.wireguardvpn.BuildConfig
 import com.barsam.wireguardvpn.models.ConnectionMode
+import com.barsam.wireguardvpn.models.ExitMode
 import com.barsam.wireguardvpn.models.VPNProfile
+import com.wireguard.android.backend.GoBackend
+import com.wireguard.android.backend.Tunnel
+import com.wireguard.config.Config
+import com.wireguard.config.InetNetwork
+import com.wireguard.config.Peer
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import org.json.JSONObject
-import java.io.*
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.*
 
 class WireGuardVpnService : VpnService() {
 
@@ -22,6 +29,11 @@ class WireGuardVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
     private var singboxProcess: Process? = null
     private var statsJob: Job? = null
+    private var wgBackend: GoBackend? = null
+    private var wgTunnel: Tunnel? = null
+    private var singboxManager: SingboxManager? = null
+    private var tunProxy: TunProxy? = null
+    private var protectedRelay: ProtectedTcpRelay? = null
 
     var connectionState = ConnectionState.DISCONNECTED
         private set
@@ -39,12 +51,6 @@ class WireGuardVpnService : VpnService() {
     private var prevBytesReceived: Long = 0
     private var prevBytesSent: Long = 0
     private var prevStatsTime: Long = 0
-
-    private val vlessUUID get() = BuildConfig.VLESS_UUID
-    private val warpVlessUUID get() = BuildConfig.WARP_VLESS_UUID
-    private val realityPublicKey get() = BuildConfig.REALITY_PUBLIC_KEY
-    private val realityShortID get() = BuildConfig.REALITY_SHORT_ID
-    private val tlsSNI get() = BuildConfig.TLS_SNI
 
     companion object {
         val commands = Channel<VpnCommand>(Channel.UNLIMITED)
@@ -64,6 +70,8 @@ class WireGuardVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        wgBackend = GoBackend(this)
+        singboxManager = SingboxManager(this)
         showNotification("Connecting...")
         scope.launch {
             for (cmd in commands) {
@@ -114,90 +122,208 @@ class WireGuardVpnService : VpnService() {
         errorMessage = null
         showNotification("Connecting to ${profile.name}...")
 
-        val peerEndpoint = profile.config.peers.firstOrNull()?.endpoint ?: run {
-            connectionState = ConnectionState.ERROR
-            errorMessage = "No server endpoint in profile"
-            showNotification("Error: no endpoint")
-            return
+        when (mode) {
+            ConnectionMode.DIRECT -> connectWireGuard(profile)
+            ConnectionMode.STEALTH, ConnectionMode.WARP_STEALTH -> connectSingBox(profile, mode)
         }
-        val serverAddress = peerEndpoint.substringBefore(":")
+    }
 
-        val config = when (mode) {
-            ConnectionMode.DIRECT -> generateWireGuardConfig(serverAddress, profile)
-            ConnectionMode.STEALTH -> generateVLESSConfig(serverAddress, profile)
-            ConnectionMode.WARP_STEALTH -> generateWARPConfig(serverAddress, profile)
-        }
+    // --- Direct WireGuard using the native GoBackend library ---
 
-        val configFile = File(filesDir, "sing-box-config.json")
-        configFile.writeText(config)
-        configFile.setReadable(false, false)
-        configFile.setReadable(true, true)
-
+    private suspend fun connectWireGuard(profile: VPNProfile) {
         try {
-            vpnInterface = Builder()
-                .setSession("WireGuardVPN")
-                .addAddress("172.19.0.1", 30)
-                .addRoute("0.0.0.0", 0)
-                .addDnsServer(profile.config.interface_.dns ?: "1.1.1.1")
-                .setMtu(1280)
-                .setBlocking(true)
-                .establish()
-
-            if (vpnInterface == null) {
-                connectionState = ConnectionState.ERROR
-                errorMessage = "VPN permission denied"
-                showNotification("Error: permission denied")
+            val peer = profile.config.peers.firstOrNull()
+            if (peer == null) {
+                setError("No server endpoint in profile")
                 return
             }
-        } catch (e: Exception) {
-            connectionState = ConnectionState.ERROR
-            errorMessage = "Failed to create VPN tunnel"
-            showNotification("Error: tunnel failed")
-            return
-        }
 
-        val singboxBin = File(applicationInfo.nativeLibraryDir, "libsingbox.so")
-        if (!singboxBin.exists()) {
-            val altBin = File(filesDir, "sing-box")
-            if (!altBin.exists()) {
-                connectionState = ConnectionState.ERROR
-                errorMessage = "VPN engine not found"
-                showNotification("Error: engine missing")
-                return
+            val ifaceBuilder = com.wireguard.config.Interface.Builder()
+                .parseAddresses(profile.config.interface_.address)
+                .parsePrivateKey(profile.config.interface_.privateKey)
+            profile.config.interface_.dns?.let { ifaceBuilder.parseDnsServers(it) }
+
+            val peerBuilder = Peer.Builder()
+                .parsePublicKey(peer.publicKey)
+                .parseEndpoint(peer.endpoint)
+                .parseAllowedIPs(peer.allowedIPs)
+            peer.presharedKey?.let { peerBuilder.parsePreSharedKey(it) }
+            peer.persistentKeepalive?.let { peerBuilder.parsePersistentKeepalive(it.toString()) }
+
+            val wgConfig = Config.Builder()
+                .setInterface(ifaceBuilder.build())
+                .addPeer(peerBuilder.build())
+                .build()
+
+            val tunnelName = "wg0"
+            val tunnel = object : Tunnel {
+                override fun getName() = tunnelName
+                override fun onStateChange(newState: Tunnel.State) {}
             }
-        }
+            wgTunnel = tunnel
 
-        try {
-            val binPath = if (singboxBin.exists()) singboxBin.absolutePath
-                else File(filesDir, "sing-box").absolutePath
+            TelemetryManager.log("wg_connecting", mapOf(
+                "server" to profile.name,
+                "endpoint" to peer.endpoint
+            ))
 
-            val builder = ProcessBuilder(binPath, "run", "-c", configFile.absolutePath)
-                .redirectErrorStream(true)
-            builder.environment()["HOME"] = filesDir.absolutePath
-            singboxProcess = builder.start()
+            val state = wgBackend?.setState(tunnel, Tunnel.State.UP, wgConfig)
 
-            val connected = waitForTunnel()
-            if (connected) {
+            if (state == Tunnel.State.UP) {
                 connectionState = ConnectionState.CONNECTED
                 connectedAt = System.currentTimeMillis()
                 prevBytesReceived = 0
                 prevBytesSent = 0
                 prevStatsTime = System.currentTimeMillis()
-                startStatsPolling()
+                startStatsPollingWG()
                 showNotification("Connected - ${profile.name}")
+                TelemetryManager.log("connected", mapOf("server" to profile.name, "mode" to "DIRECT"))
             } else {
-                cleanup()
-                connectionState = ConnectionState.ERROR
-                errorMessage = "Failed to establish tunnel"
-                showNotification("Error: tunnel failed")
+                setError("WireGuard tunnel failed to come up")
             }
         } catch (e: Exception) {
-            cleanup()
-            connectionState = ConnectionState.ERROR
-            errorMessage = "Connection failed"
-            showNotification("Error: connection failed")
+            setError("Connection failed")
+            TelemetryManager.log("error", mapOf("message" to "WG error: ${e.message?.take(100)}"))
         }
     }
+
+    private fun startStatsPollingWG() {
+        statsJob = scope.launch {
+            while (isActive) {
+                try {
+                    val stats = wgBackend?.getStatistics(wgTunnel!!) ?: break
+                    val now = System.currentTimeMillis()
+                    val elapsed = (now - prevStatsTime) / 1000.0
+                    if (elapsed > 0) {
+                        statistics = statistics.copy(
+                            downloadSpeed = (stats.totalRx() - prevBytesReceived) / elapsed,
+                            uploadSpeed = (stats.totalTx() - prevBytesSent) / elapsed,
+                            bytesReceived = stats.totalRx(),
+                            bytesSent = stats.totalTx()
+                        )
+                    }
+                    prevBytesReceived = stats.totalRx()
+                    prevBytesSent = stats.totalTx()
+                    prevStatsTime = now
+                } catch (_: Exception) {}
+                delay(1000)
+            }
+        }
+    }
+
+    // --- Stealth/WARP modes via sing-box SOCKS5 + TunProxy (TCP + full UDP) ---
+
+    private suspend fun connectSingBox(profile: VPNProfile, mode: ConnectionMode) {
+        // LoopholeVPN runs on one fixed server. Always use the compiled-in Vultr
+        // endpoint for Stealth/WARP, ignoring the selected profile's WireGuard
+        // endpoint (which may be a stale/old server). The baked-in Reality creds
+        // are only valid for this host anyway.
+        // Exit selection (same server, different port): RESIDENTIAL=:443 (clean Rogers
+        // ISP IP), DIRECT=:8444 (straight out the Vultr node — faster, full UDP).
+        val exitDirect = getSharedPreferences("vpn_prefs", MODE_PRIVATE)
+            .getInt("exit_mode", 0) == ExitMode.DIRECT.value
+        val serverAddress = BuildConfig.SERVER_HOST
+        val serverPort = if (exitDirect) BuildConfig.SERVER_PORT_DIRECT else BuildConfig.SERVER_PORT
+
+        try {
+            val mgr = singboxManager ?: run {
+                setError("sing-box manager not initialized")
+                return
+            }
+
+            mgr.debugLog("=== connectSingBox: mode=$mode server=$serverAddress:$serverPort ===")
+
+            // Fixed public resolver (queried through the tunnel); don't trust the
+            // selected profile's DNS, which may point at an old server's resolver.
+            val dns = "1.1.1.1"
+
+            // 1. Start sing-box SOCKS5 proxy
+            val configJson = mgr.generateConfig(mode, 0, serverAddress, dns, serverPort)
+            val configPath = mgr.writeConfig(configJson)
+
+            mgr.debugLog("Starting sing-box (SOCKS5 mode, server=$serverAddress:$serverPort)...")
+            val started = mgr.start(configPath, 0)
+            if (!started) {
+                setError("sing-box failed to start")
+                cleanup()
+                return
+            }
+
+            // 2. Create VPN TUN interface
+            mgr.debugLog("Creating VPN TUN interface...")
+            val builder = Builder()
+                .setSession("WireGuardVPN")
+                .addAddress("172.19.0.1", 30)
+                .addRoute("0.0.0.0", 0)
+                .addDnsServer(dns)
+                .setMtu(1500)
+                .setBlocking(true)
+            try { builder.addDisallowedApplication("com.barsam.WireGuardVPN") } catch (_: Exception) {}
+            try { builder.addDisallowedApplication("com.barsam.WireGuardVPN.debug") } catch (_: Exception) {}
+            val pfd = builder.establish()
+
+            if (pfd == null) {
+                setError("VPN permission denied")
+                cleanup()
+                return
+            }
+
+            // 3. Start TunProxy — bridges VPN TUN → SOCKS5 (TCP) + direct (UDP)
+            mgr.debugLog("Starting TunProxy → 127.0.0.1:1080")
+            tunProxy = TunProxy(this, pfd, "127.0.0.1", 1080, dns)
+            tunProxy?.start()
+            mgr.debugLog("TunProxy started — TCP via SOCKS5, UDP via protected sockets")
+
+            // 4. Connected
+            delay(1500)
+            if (connectionState == ConnectionState.CONNECTING) {
+                connectionState = ConnectionState.CONNECTED
+                connectedAt = System.currentTimeMillis()
+                prevBytesReceived = 0
+                prevBytesSent = 0
+                prevStatsTime = System.currentTimeMillis()
+                startStatsPollingSingbox()
+                val modeLabel = if (mode == ConnectionMode.STEALTH) "Stealth" else "WARP"
+                showNotification("Connected - ${profile.name} ($modeLabel)")
+                TelemetryManager.log("connected", mapOf("server" to profile.name, "mode" to modeLabel))
+            }
+
+        } catch (e: Exception) {
+            singboxManager?.debugLog("connectSingBox FAILED: ${e.message}")
+            setError("Connection failed: ${e.message?.take(80)}")
+            cleanup()
+        }
+    }
+
+    private fun startStatsPollingSingbox() {
+        statsJob = scope.launch {
+            while (isActive) {
+                try {
+                    val mgr = singboxManager ?: break
+                    val stats = mgr.getTrafficStats()
+                    if (stats != null) {
+                        val (down, up) = stats
+                        val now = System.currentTimeMillis()
+                        val elapsed = (now - prevStatsTime) / 1000.0
+                        if (elapsed > 0 && prevStatsTime > 0) {
+                            statistics = statistics.copy(
+                                downloadSpeed = (down - prevBytesReceived) / elapsed,
+                                uploadSpeed = (up - prevBytesSent) / elapsed,
+                                bytesReceived = down,
+                                bytesSent = up
+                            )
+                        }
+                        prevBytesReceived = down
+                        prevBytesSent = up
+                        prevStatsTime = now
+                    }
+                } catch (_: Exception) {}
+                delay(1000)
+            }
+        }
+    }
+
+    // --- Common ---
 
     private suspend fun handleDisconnect() {
         if (connectionState == ConnectionState.DISCONNECTED) return
@@ -214,247 +340,29 @@ class WireGuardVpnService : VpnService() {
     private fun cleanup() {
         statsJob?.cancel()
         statsJob = null
+        // TunProxy
+        tunProxy?.stop()
+        tunProxy = null
+        // Protected TCP relay
+        protectedRelay?.stop()
+        protectedRelay = null
+        // WireGuard
+        try {
+            wgTunnel?.let { wgBackend?.setState(it, Tunnel.State.DOWN, null) }
+        } catch (_: Exception) {}
+        // sing-box
+        singboxManager?.stop()
         singboxProcess?.destroy()
         singboxProcess = null
+        // VPN interface (already detached if using tun2socks, but close if still held)
         try { vpnInterface?.close() } catch (_: Exception) {}
         vpnInterface = null
     }
 
-    private suspend fun waitForTunnel(): Boolean {
-        repeat(20) {
-            delay(500)
-            if (checkClashAPI()) return true
-        }
-        return false
-    }
-
-    private fun checkClashAPI(): Boolean {
-        return try {
-            val conn = URL("http://127.0.0.1:9090/version").openConnection() as HttpURLConnection
-            conn.connectTimeout = 2000
-            conn.readTimeout = 2000
-            conn.responseCode == 200
-        } catch (_: Exception) {
-            false
-        }
-    }
-
-    private fun startStatsPolling() {
-        statsJob = scope.launch {
-            while (isActive) {
-                pollStats()
-                delay(1000)
-            }
-        }
-    }
-
-    private fun pollStats() {
-        try {
-            val conn = URL("http://127.0.0.1:9090/connections").openConnection() as HttpURLConnection
-            conn.connectTimeout = 2000
-            conn.readTimeout = 2000
-            if (conn.responseCode != 200) return
-
-            val json = JSONObject(conn.inputStream.bufferedReader().readText())
-            val downTotal = json.optLong("downloadTotal", 0)
-            val upTotal = json.optLong("uploadTotal", 0)
-
-            val now = System.currentTimeMillis()
-            val elapsed = (now - prevStatsTime) / 1000.0
-            if (elapsed > 0) {
-                statistics = statistics.copy(
-                    downloadSpeed = (downTotal - prevBytesReceived) / elapsed,
-                    uploadSpeed = (upTotal - prevBytesSent) / elapsed,
-                    bytesReceived = downTotal,
-                    bytesSent = upTotal
-                )
-            }
-            prevBytesReceived = downTotal
-            prevBytesSent = upTotal
-            prevStatsTime = now
-        } catch (_: Exception) {}
-    }
-
-    // --- Config generators ---
-
-    private fun generateWireGuardConfig(serverAddress: String, profile: VPNProfile): String {
-        val port = profile.config.peers.firstOrNull()?.endpoint?.substringAfterLast(":") ?: "51820"
-        val dns = profile.config.interface_.dns ?: "1.1.1.1"
-        val pubKey = profile.config.peers.firstOrNull()?.publicKey ?: ""
-        return """
-        {
-          "log": {"level": "warning"},
-          "dns": {
-            "servers": [
-              {"tag": "remote", "type": "udp", "server": "$dns", "detour": "wg-ep"}
-            ],
-            "strategy": "prefer_ipv4"
-          },
-          "inbounds": [{
-            "type": "tun",
-            "tag": "tun-in",
-            "address": "172.19.0.1/30",
-            "auto_route": true,
-            "strict_route": true,
-            "stack": "mixed",
-            "fd": ${vpnInterface?.fd ?: -1}
-          }],
-          "endpoints": [
-            {
-              "type": "wireguard",
-              "tag": "wg-ep",
-              "address": ["${profile.config.interface_.address}"],
-              "private_key": "${profile.config.interface_.privateKey}",
-              "peers": [
-                {
-                  "address": "$serverAddress",
-                  "port": $port,
-                  "public_key": "$pubKey",
-                  "allowed_ips": ["0.0.0.0/0"]
-                }
-              ],
-              "mtu": 1280
-            }
-          ],
-          "outbounds": [
-            {"type": "direct", "tag": "direct"},
-            {"type": "block", "tag": "block"}
-          ],
-          "route": {
-            "rules": [
-              {"action": "sniff"},
-              {"protocol": "dns", "action": "hijack-dns"},
-              {"ip_is_private": true, "outbound": "direct"}
-            ],
-            "auto_detect_interface": true,
-            "final": "wg-ep"
-          },
-          "experimental": {
-            "clash_api": {
-              "external_controller": "127.0.0.1:9090"
-            }
-          }
-        }
-        """.trimIndent()
-    }
-
-    private fun generateVLESSConfig(serverAddress: String, profile: VPNProfile): String {
-        val dns = profile.config.interface_.dns ?: "1.1.1.1"
-        return """
-        {
-          "log": {"level": "warning"},
-          "dns": {
-            "servers": [
-              {"tag": "remote", "type": "udp", "server": "$dns", "detour": "proxy-out"}
-            ],
-            "strategy": "prefer_ipv4"
-          },
-          "inbounds": [{
-            "type": "tun",
-            "tag": "tun-in",
-            "address": "172.19.0.1/30",
-            "auto_route": true,
-            "strict_route": true,
-            "stack": "mixed",
-            "fd": ${vpnInterface?.fd ?: -1}
-          }],
-          "outbounds": [
-            {
-              "type": "vless",
-              "tag": "proxy-out",
-              "server": "$serverAddress",
-              "server_port": 443,
-              "uuid": "$vlessUUID",
-              "flow": "xtls-rprx-vision",
-              "tls": {
-                "enabled": true,
-                "server_name": "$tlsSNI",
-                "utls": {"enabled": true, "fingerprint": "safari"},
-                "reality": {
-                  "enabled": true,
-                  "public_key": "$realityPublicKey",
-                  "short_id": "$realityShortID"
-                }
-              }
-            },
-            {"type": "direct", "tag": "direct"},
-            {"type": "block", "tag": "block"}
-          ],
-          "route": {
-            "rules": [
-              {"action": "sniff"},
-              {"protocol": "dns", "action": "hijack-dns"},
-              {"ip_is_private": true, "outbound": "direct"}
-            ],
-            "auto_detect_interface": true,
-            "final": "proxy-out"
-          },
-          "experimental": {
-            "clash_api": {
-              "external_controller": "127.0.0.1:9090"
-            }
-          }
-        }
-        """.trimIndent()
-    }
-
-    private fun generateWARPConfig(serverAddress: String, profile: VPNProfile): String {
-        val dns = profile.config.interface_.dns ?: "1.1.1.1"
-        return """
-        {
-          "log": {"level": "warning"},
-          "dns": {
-            "servers": [
-              {"tag": "remote", "type": "udp", "server": "$dns", "detour": "proxy-out"}
-            ],
-            "strategy": "prefer_ipv4"
-          },
-          "inbounds": [{
-            "type": "tun",
-            "tag": "tun-in",
-            "address": "172.19.0.1/30",
-            "auto_route": true,
-            "strict_route": true,
-            "stack": "mixed",
-            "fd": ${vpnInterface?.fd ?: -1}
-          }],
-          "outbounds": [
-            {
-              "type": "vless",
-              "tag": "proxy-out",
-              "server": "$serverAddress",
-              "server_port": 443,
-              "uuid": "$warpVlessUUID",
-              "flow": "xtls-rprx-vision",
-              "tls": {
-                "enabled": true,
-                "server_name": "$tlsSNI",
-                "utls": {"enabled": true, "fingerprint": "safari"},
-                "reality": {
-                  "enabled": true,
-                  "public_key": "$realityPublicKey",
-                  "short_id": "$realityShortID"
-                }
-              }
-            },
-            {"type": "direct", "tag": "direct"},
-            {"type": "block", "tag": "block"}
-          ],
-          "route": {
-            "rules": [
-              {"action": "sniff"},
-              {"protocol": "dns", "action": "hijack-dns"},
-              {"ip_is_private": true, "outbound": "direct"}
-            ],
-            "auto_detect_interface": true,
-            "final": "proxy-out"
-          },
-          "experimental": {
-            "clash_api": {
-              "external_controller": "127.0.0.1:9090"
-            }
-          }
-        }
-        """.trimIndent()
+    private fun setError(msg: String) {
+        connectionState = ConnectionState.ERROR
+        errorMessage = msg
+        showNotification("Error")
+        TelemetryManager.log("error", mapOf("message" to msg))
     }
 }

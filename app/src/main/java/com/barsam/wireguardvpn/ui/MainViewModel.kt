@@ -8,9 +8,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.barsam.wireguardvpn.models.*
 import com.barsam.wireguardvpn.services.ProfileStore
+import com.barsam.wireguardvpn.services.TelemetryManager
 import com.barsam.wireguardvpn.services.UpdateManager
 import com.barsam.wireguardvpn.services.UpdateState
-import kotlinx.serialization.Serializable
 import com.barsam.wireguardvpn.services.WireGuardVpnService
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
@@ -27,7 +27,11 @@ data class VpnUiState(
     val selectedTab: Int = 0,
     val updateState: UpdateState = UpdateState.Idle,
     val pendingDownloadUrl: String? = null,
-    val pendingDownloadSha256: String? = null
+    val pendingDownloadSha256: String? = null,
+    val telemetryEnabled: Boolean = false,
+    val telemetryEndpoint: String = "http://localhost:8420",
+    val connectionMode: ConnectionMode = ConnectionMode.DIRECT,
+    val exitMode: ExitMode = ExitMode.RESIDENTIAL
 )
 
 class MainViewModel : ViewModel() {
@@ -36,7 +40,22 @@ class MainViewModel : ViewModel() {
 
     fun loadProfiles(context: Context) {
         val store = ProfileStore.get(context)
-        _state.update { it.copy(profiles = store.profiles) }
+        val prefs = context.getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
+        val savedMode = ConnectionMode.fromValue(prefs.getInt("connection_mode", 0))
+        val savedExit = ExitMode.fromValue(prefs.getInt("exit_mode", 0))
+        _state.update { it.copy(profiles = store.profiles, connectionMode = savedMode, activeMode = savedMode, exitMode = savedExit) }
+    }
+
+    fun setConnectionMode(context: Context, mode: ConnectionMode) {
+        context.getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
+            .edit().putInt("connection_mode", mode.value).apply()
+        _state.update { it.copy(connectionMode = mode, activeMode = mode) }
+    }
+
+    fun setExitMode(context: Context, exit: ExitMode) {
+        context.getSharedPreferences("vpn_prefs", Context.MODE_PRIVATE)
+            .edit().putInt("exit_mode", exit.value).apply()
+        _state.update { it.copy(exitMode = exit) }
     }
 
     fun addProfile(context: Context, profile: VPNProfile) {
@@ -92,9 +111,15 @@ class MainViewModel : ViewModel() {
                 activeMode = mode
             )
         }
+        TelemetryManager.log("connect_attempt", mapOf(
+            "server" to profile.name,
+            "mode" to mode.name
+        ))
     }
 
     fun disconnect(context: Context) {
+        val duration = _state.value.connectedDuration
+        val stats = _state.value.statistics
         WireGuardVpnService.commands.trySend(WireGuardVpnService.VpnCommand.Disconnect)
         _state.update {
             it.copy(
@@ -102,6 +127,11 @@ class MainViewModel : ViewModel() {
                 errorMessage = null
             )
         }
+        TelemetryManager.log("disconnect_request", mapOf(
+            "durationMs" to duration,
+            "bytesDown" to stats.bytesReceived,
+            "bytesUp" to stats.bytesSent
+        ))
     }
 
     fun startPolling(context: Context) {
@@ -109,9 +139,11 @@ class MainViewModel : ViewModel() {
             while (true) {
                 val service = WireGuardVpnService.instance
                 if (service != null) {
+                    val prev = _state.value.connectionState
+                    val next = mapState(service.connectionState)
                     _state.update {
                         it.copy(
-                            connectionState = mapState(service.connectionState),
+                            connectionState = next,
                             statistics = service.statistics,
                             connectedDuration = if (service.connectedAt > 0)
                                 System.currentTimeMillis() - service.connectedAt else 0,
@@ -119,6 +151,19 @@ class MainViewModel : ViewModel() {
                             activeProfile = service.activeProfile ?: it.activeProfile,
                             activeMode = service.activeMode ?: it.activeMode
                         )
+                    }
+                    // Telemetry on state transitions
+                    if (prev != next) {
+                        when (next) {
+                            ConnectionState.CONNECTED -> TelemetryManager.log("connected", mapOf(
+                                "server" to (service.activeProfile?.name ?: ""),
+                                "mode" to (service.activeMode?.name ?: "")
+                            ))
+                            ConnectionState.ERROR -> TelemetryManager.log("error", mapOf(
+                                "message" to (service.errorMessage ?: "unknown")
+                            ))
+                            else -> {}
+                        }
                     }
                 } else {
                     val current = _state.value.connectionState
@@ -142,6 +187,7 @@ class MainViewModel : ViewModel() {
             } else {
                 _state.update { it.copy(updateState = result) }
             }
+            TelemetryManager.log("update_check", mapOf("result" to result.javaClass.simpleName))
         }
     }
 
@@ -156,6 +202,32 @@ class MainViewModel : ViewModel() {
 
     fun installUpdate(context: Context, filePath: String) {
         UpdateManager.installUpdate(context, filePath)
+    }
+
+    // --- Telemetry methods ---
+
+    fun initTelemetry(context: Context) {
+        TelemetryManager.init(context)
+        _state.update {
+            it.copy(
+                telemetryEnabled = TelemetryManager.isEnabled,
+                telemetryEndpoint = TelemetryManager.currentEndpoint
+            )
+        }
+        TelemetryManager.log("app_launch")
+    }
+
+    fun setTelemetryEnabled(context: Context, enabled: Boolean) {
+        TelemetryManager.setEnabled(context, enabled)
+        _state.update { it.copy(telemetryEnabled = enabled) }
+        if (enabled) {
+            TelemetryManager.log("telemetry_enabled")
+        }
+    }
+
+    fun setTelemetryEndpoint(context: Context, url: String) {
+        TelemetryManager.setEndpoint(context, url)
+        _state.update { it.copy(telemetryEndpoint = url) }
     }
 
     // --- Internal ---
